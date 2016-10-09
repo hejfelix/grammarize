@@ -1,88 +1,102 @@
 import cats.free.Free
 import cats.free.Free.liftF
-import cats.{Monad, RecursiveTailRecM, ~>}
+import cats.{~>, data, Eval}
+import cats.data.{State, StateT}
 
-import scala.annotation.tailrec
 import scala.util.matching.Regex
 import scala.util.matching.Regex.Match
 
 sealed trait GrammarA[A]
-case class Regx[T](key: Regex) extends GrammarA[T]
-case class Optional[T](grammar: Free[GrammarA, T]) extends GrammarA[T]
-
-object ParseResult {
-  implicit def monad[T] =
-    new Monad[ParseResult] with RecursiveTailRecM[ParseResult] {
-      override def pure[A](x: A): ParseResult[A] = ParseSuccess(x)
-      override def flatMap[A, B](fa: ParseResult[A])(
-        f: (A) => ParseResult[B]): ParseResult[B] =
-        fa match {
-          case pf @ ParseFailure() => ParseFailure()
-          case ParseSuccess(remaining) => f(remaining)
-        }
-      @tailrec
-      override def tailRecM[A, B](a: A)(
-        f: (A) => ParseResult[Either[A, B]]): ParseResult[B] =
-        f(a) match {
-          case ParseSuccess(Right(result)) => ParseSuccess(result)
-          case ParseSuccess(Left(result)) => tailRecM(result)(f)
-          case ParseFailure() => ParseFailure()
-        }
-    }
-}
-sealed trait ParseResult[+T]
-case class ParseSuccess[T](remaining: T) extends ParseResult[T]
-case class ParseFailure() extends ParseResult[Nothing]
+case class Regx[T](key: Regex)                                   extends GrammarA[T]
+case class Optional[T](grammar: Free[GrammarA, T])               extends GrammarA[T]
+case class Choice[T](g: Free[GrammarA, T], f: Free[GrammarA, T]) extends GrammarA[T]
 
 object FreeAppGrammar extends App {
 
   type Grammar[A] = Free[GrammarA, A]
 
-  // Put returns nothing (i.e. Unit).
-  def regx[T](key: Regex): Grammar[T] =
-  liftF[GrammarA, T](Regx[T](key))
+  def regx(regex: Regex): Grammar[String] =
+    liftF(Regx[String](regex))
 
-  // Get returns a T value.
+  def choice[T](g: Grammar[T], f: Grammar[T]): Grammar[T] =
+    liftF(Choice(g, f))
+
   def optional[T](g: Grammar[T]): Grammar[T] =
-  liftF[GrammarA, T](Optional[T](g))
+    liftF(Optional[T](g))
 
-  implicit class FollowedBy[T](g: Grammar[T]) {
-    def ~(h: Grammar[T]) = for (a <- g; b <- h) yield b
+  implicit class GrammarOps[T](g: Grammar[T]) {
+    def ~(h: Grammar[T]): Grammar[T] = for (a <- g; b <- h) yield b
+    def * : Grammar[T]               = optional(g)
+    def |(h: Grammar[T]): Grammar[T] = choice(g, h)
   }
 
-  def program: Free[GrammarA, String] =
-    regx[String]("1".r) ~ optional(regx("2".r)) ~ regx("3".r)
+  def grammar: Grammar[String] = {
+    val aOrB: Grammar[String]   = regx("a".r) | regx("b".r)
+    val one: Grammar[String]    = regx("1".r)
+    val maybe2: Grammar[String] = regx("2".r).*
+    val three: Grammar[String]  = regx("3".r)
+    one ~ maybe2 ~ three ~ aOrB
+  }
 
-  println(program)
-  private val result: String =
-    program.foldMap(impureParserInterpreter("13479")) match {
-      case ParseSuccess(remaining) => remaining
-      case ParseFailure() =>  ""
-    }
-  println(result)
+  val testStrings = Seq(
+    "123",
+    "13a",
+    "123b",
+    "12b",
+    "133a",
+    "1",
+    "123a1337",
+    "13b42"
+  )
 
-  def impureParserInterpreter(input: String): GrammarA ~> ParseResult =
-    new (GrammarA ~> ParseResult) {
-      var state = input
-      def apply[A](fa: GrammarA[A]): ParseResult[A] =
+  def parseAndPresent(g: Grammar[String])(s: String) = {
+    val parseResult = grammar.foldMap(parserInterpreter).run(s).value
+    println(s"$s:  $parseResult")
+  }
+
+  testStrings map parseAndPresent(grammar)
+
+  type ParserInterpreterState[A] = State[String, A]
+
+  def parseOptional[A](runB: ParserInterpreterState[A]): State[String, A] =
+    State.apply(state => {
+      runB
+        .map(_ match {
+          case ParseFailure() => ParseSuccess(state).asInstanceOf[A]
+          case p @ _          => p.asInstanceOf[A]
+        })
+        .run(state)
+        .value
+    })
+
+  def parseRegex[A](regex: Regex): State[String, A] =
+    State.apply(state =>
+      regex.findPrefixMatchOf(state) match {
+        case Some(Match(str)) =>
+          val rest = state.drop(str.length)
+          (rest, ParseSuccess(rest).asInstanceOf[A])
+        case None =>
+          (state, ParseFailure().asInstanceOf[A])
+
+    })
+
+  def parserInterpreter: GrammarA ~> ParserInterpreterState =
+    new (GrammarA ~> ParserInterpreterState) {
+      def apply[A](fa: GrammarA[A]): ParserInterpreterState[A] =
         fa match {
-          case Regx(key) =>
-            val result: ParseResult[String] =
-              key.findPrefixMatchOf(state) match {
-                case Some(Match(str)) =>
-                  state = state.drop(str.length)
-                  ParseSuccess(state)
-                case None =>
-                  ParseFailure()
+          case Regx(key)   => parseRegex(key)
+          case Optional(b) => parseOptional(b.foldMap(this))
+          case Choice(a, b) =>
+            State.apply(state => {
+              val runA = a.foldMap(this).run(state).value
+              if (runA._2.asInstanceOf[ParseResult[_]].isSuccess)
+                runA
+              else {
+                b.foldMap(this).run(state).value
               }
-            result.asInstanceOf[ParseResult[A]]
-          case Optional(b) =>
-            val result: ParseResult[Any] = b.foldMap(this) match {
-              case ParseSuccess(remaining) => ParseSuccess(remaining)
-              case ParseFailure() => ParseSuccess(state)
-            }
-            result.asInstanceOf[ParseResult[A]]
+            })
         }
+
     }
 
 }
