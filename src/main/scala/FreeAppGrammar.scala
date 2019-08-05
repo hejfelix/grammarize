@@ -1,8 +1,10 @@
+import cats.arrow.FunctionK
+import cats.data.State
 import cats.free.Free
 import cats.free.Free.liftF
-import cats.{~>, data, Eval}
-import cats.data.{State, StateT}
+import com.mifmif.common.regex.Generex
 
+import scala.util.Random
 import scala.util.matching.Regex
 import scala.util.matching.Regex.Match
 
@@ -29,7 +31,7 @@ object FreeAppGrammar extends App {
     liftF(Multi[T](g))
 
   implicit class GrammarOps[T](g: Grammar[T]) {
-    def ~(h: Grammar[T]): Grammar[T] = for (a <- g; b <- h) yield b
+    def ~(h: Grammar[T]): Grammar[T] = for (_ <- g; b <- h) yield b
     def ? : Grammar[T]               = optional(g)
     def |(h: Grammar[T]): Grammar[T] = choice(g, h)
     def + : Grammar[T]               = multi(g)
@@ -43,44 +45,30 @@ object FreeAppGrammar extends App {
     one ~ maybe2 ~ three ~ aOrB
   }
 
-  def listGrammar = {
+  def listGrammar: Grammar[String] = {
     val openBracket = regx("\\[".r)
     val digit       = regx("\\d".r)
     val endBracket  = regx("\\]".r)
     val moreDigits  = (regx(",".r) ~ digit).+
-    openBracket ~ digit ~ (moreDigits).? ~ endBracket
+    openBracket ~ digit ~ moreDigits.? ~ endBracket
   }
 
-  val testStrings = Seq(
-    "123",
-    "13a",
-    "123b",
-    "12b",
-    "133a",
-    "1",
-    "123a1337",
-    "13b42"
-  )
+  val generator                        = generate(sizeHint = 42, randomSeed = 1337)
+  val generated: GenerateState[String] = listGrammar.foldMap(generator)
 
-  parseAndPresent(regx("7".r).+)("7778")
-  parseAndPresent(listGrammar)("[5,4,10]")
-
-  def parseAndPresent(g: Grammar[String])(s: String) = {
-    val parseResult = g.foldMap(parserInterpreter).run(s).value
-    println(s"$s:  $parseResult")
+  println(listGrammar)
+  for (_ <- 0 to 20) {
+    println(generated.run(initial = "").value._2)
   }
-
-  testStrings map parseAndPresent(grammar)
-
   type ParserInterpreterState[A] = State[String, A]
 
   def parseOptional[A](runB: ParserInterpreterState[A]): State[String, A] =
     State.apply(state => {
       runB
-        .map(_ match {
+        .map {
           case ParseFailure() => ParseSuccess(state).asInstanceOf[A]
           case p @ _          => p.asInstanceOf[A]
-        })
+        }
         .run(state)
         .value
     })
@@ -96,8 +84,47 @@ object FreeAppGrammar extends App {
 
     })
 
-  def parserInterpreter: GrammarA ~> ParserInterpreterState =
-    new (GrammarA ~> ParserInterpreterState) {
+  type GenerateState[R] = State[String, R]
+
+  def generate(sizeHint: Int, randomSeed: Long = System.currentTimeMillis()): FunctionK[GrammarA, GenerateState] =
+    new FunctionK[GrammarA, GenerateState] {
+
+      private val javaRandom  = new java.util.Random(randomSeed)
+      private val scalaRandom = new Random(randomSeed)
+
+      def multi(g: Grammar[_], count: Int): GenerateState[String] =
+        for {
+          _    <- g.foldMap(this)
+          rest <- if (count == 0) State((s: String) => (s, s)) else multi(g, count - 1)
+          _    <- State.set(rest.asInstanceOf[String])
+        } yield {
+          rest.asInstanceOf[String]
+        }
+
+      override def apply[A](fa: GrammarA[A]): GenerateState[A] = fa match {
+        case Regx(reg) =>
+          State { str =>
+            val generex   = new Generex(reg.pattern.pattern(), javaRandom)
+            val generated = generex.random()
+            val res       = str + generated
+            (res, res.asInstanceOf[A])
+          }
+        case Optional(grammar) =>
+          val doGenerate = scalaRandom.nextBoolean()
+          if (doGenerate) {
+            grammar.foldMap(this)
+          } else {
+            State(str => (str, str.asInstanceOf[A]))
+          }
+        case Choice(g, f) =>
+          val pattern: Free[GrammarA, A] = if (scalaRandom.nextBoolean()) g else f
+          pattern.foldMap(this)
+        case Multi(g) => multi(g, scalaRandom.nextInt(sizeHint)).map(_.asInstanceOf[A])
+      }
+    }
+
+  def parserInterpreter: FunctionK[GrammarA, ParserInterpreterState] =
+    new FunctionK[GrammarA, ParserInterpreterState] {
       def apply[A](fa: GrammarA[A]): ParserInterpreterState[A] =
         fa match {
           case Regx(regexp) => parseRegex(regexp)
@@ -108,8 +135,9 @@ object FreeAppGrammar extends App {
                 g.foldMap(this)
                   .run(state)
                   .map {
-                    case (s, ParseSuccess(_))    => x.run(s).value
-                    case r @ (s, ParseFailure()) => (s, ParseSuccess(s).asInstanceOf[A])
+                    case (s, ParseSuccess(_)) => x.run(s).value
+                    case (s, ParseFailure())  => (s, ParseSuccess(s).asInstanceOf[A])
+                    case (_, _)               => ???
                   }
                   .value
               })
