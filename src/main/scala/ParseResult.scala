@@ -7,4 +7,4 @@ sealed trait ParseResult[+T] {
 case class ParseSuccess[T](remaining: T) extends ParseResult[T] {
   override def isSuccess: Boolean = true
 }
-case class ParseFailure() extends ParseResult[Nothing]
+case class ParseFailure(message: String) extends ParseResult[Nothing]
